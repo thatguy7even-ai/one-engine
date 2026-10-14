@@ -40,12 +40,24 @@ class Capsule:
         return json.dumps(asdict(self), indent=2, sort_keys=True)
 
 
+def _hash_input(data: Any) -> str:
+    """Four's Break 1 fix: hash the CONTENT, not its length.
+    numpy arrays -> shape + raw bytes; everything else -> canonical JSON."""
+    import numpy as _np
+    h = hashlib.sha256()
+    if isinstance(data, _np.ndarray):
+        h.update(str(data.shape).encode())
+        h.update(data.tobytes())
+    else:
+        h.update(json.dumps(data, sort_keys=True, default=str).encode())
+    return h.hexdigest()[:16]
+
+
 def capsule_seal(input_data: Any, stages: List[Dict[str, Any]],
                  verdict: Dict[str, Any], provenance: List[Dict[str, Any]],
                  marks: List[str]) -> Capsule:
     """Seal an engine run into a verifiable capsule."""
-    ih = hashlib.sha256(
-        json.dumps(str(input_data), sort_keys=True).encode()).hexdigest()[:16]
+    ih = _hash_input(input_data)
     cap = Capsule(
         magic=MAGIC, version=ENGINE_VERSION,
         created_utc=datetime.now(timezone.utc).isoformat(),
