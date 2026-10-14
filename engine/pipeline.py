@@ -105,18 +105,56 @@ def run_text_lane(raw):
 
 
 def run_series_lane(series):
-    """Lane B: trend -> trigger, composed."""
+    """Lane B: trend -> detrend -> trigger, with honesty gating.
+    Alpha's DIVERGE 1: honest dataflow — TrendStage outputs slope, pipeline
+    subtracts the trend line (residuals), TriggerStage detects extrema on
+    the detrended series. Not the same raw series fed to both.
+    Alpha's DIVERGE 2: the honesty mark GATES — if trend is UNKNOWN/REFUTED
+    (R2 collapsed), the slope is unreliable, residuals are compromised, and
+    TriggerStage is skipped with the downgrade propagated (not run anyway)."""
+    import synthesis_five_overlay as syn
     t_out = TrendStage()({"series": series})
-    g_out = TriggerStage()({"series": series})
+    if t_out.honesty.verdict in ("UNKNOWN", "REFUTED"):
+        # GATE: refuse to trigger on compromised detrending. Propagate.
+        gate_mark = HonestyMark(
+            verdict=t_out.honesty.verdict,
+            basis="trigger skipped: trend unreliable, residuals compromised",
+            not_checked=t_out.honesty.not_checked,
+            breaks_if=t_out.honesty.breaks_if)
+        prov = [r.__dict__ for r in t_out.provenance]
+        prov.append({"stage": "gate", "input_ref": "trend.honesty",
+                     "output_ref": "trigger.skipped",
+                     "parameters": {"trigger_verdict": t_out.honesty.verdict},
+                     "marks": ["[GATE]"]})
+        cap = capsule_seal(str(len(series)),
+                           [{"stage": "trend", "honesty": t_out.honesty.verdict},
+                            {"stage": "gate", "action": "trigger_skipped"}],
+                           {"slope": t_out.data["slope"], "r2": t_out.data["r2"],
+                            "gated_triggers": 0, "suppressed": 0,
+                            "gate": "trigger skipped on trend UNKNOWN/REFUTED"},
+                           prov, ["[SYNTH]", "[POLICY]", "[GATE]"])
+        return (t_out, None, gate_mark), cap
+    # detrend: subtract the fitted trend line
+    n = len(series)
+    x = np.arange(n, dtype=float)
+    # block means -> per-sample trend via slope (block-equiv)
+    slope_per_sample = t_out.data["slope"] / syn.BLOCK
+    residuals = np.asarray(series, dtype=float) - slope_per_sample * x
+    g_out = TriggerStage()({"series": residuals})
     prov = [r.__dict__ for r in t_out.provenance + g_out.provenance]
+    prov.append({"stage": "detrend", "input_ref": "series+slope",
+                 "output_ref": "residuals",
+                 "parameters": {"slope_per_sample": float(slope_per_sample)},
+                 "marks": ["[DATAFLOW]"]})
     cap = capsule_seal(str(len(series)),
                        [{"stage": "trend", "honesty": t_out.honesty.verdict},
+                        {"stage": "detrend"},
                         {"stage": "trigger", "honesty": g_out.honesty.verdict}],
                        {"slope": t_out.data["slope"], "r2": t_out.data["r2"],
                         "gated_triggers": len(g_out.data["gated"]),
                         "suppressed": g_out.data["suppressed"]},
                        prov, ["[SYNTH]", "[POLICY]"])
-    return (t_out, g_out), cap
+    return (t_out, g_out, None), cap
 
 
 if __name__ == "__main__":
@@ -130,14 +168,21 @@ if __name__ == "__main__":
 
     import synthesis_five_overlay as p3
     import synthesis_five_matrix as p4
+    from engine.capsule import capsule_verify
     s_trend = p3.series(seed=3)  # trended series for the trend stage
-    s_trig = p4.generate(noise_std=4.0, seed=3)  # sine for the trigger stage
-    (t_out, g_out), cap2 = run_series_lane(s_trend)
-    # trigger stage runs on the sine series (extrema exist there)
-    g_only = TriggerStage()({"series": s_trig})
-    print(f"lane B (trend): slope={t_out.data['slope']:+.2f}/block "
-          f"R2={t_out.data['r2']:.3f} honesty={t_out.honesty.verdict}")
-    print(f"lane B (trigger): gated={len(g_only.data['gated'])} "
-          f"suppressed={g_only.data['suppressed']} honesty={g_only.honesty.verdict}")
+    (t_out, g_out, gate_mark), cap2 = run_series_lane(s_trend)
+    print(f"lane B (trend->detrend->trigger): slope={t_out.data['slope']:+.2f}/block "
+          f"R2={t_out.data['r2']:.3f} gated={len(g_out.data['gated'])} "
+          f"suppressed={g_out.data['suppressed']}")
     print(f"capsule sealed: {cap2.payload_hash[:16]}... verify={capsule_verify(cap2.to_json())}")
-    print("ONE ENGINE scaffold: both lanes run, capsules seal+verify. [EXECUTED]")
+
+    # gate path: regime shift collapses R2 -> trigger skipped, downgrade propagated
+    t = np.arange(1800, dtype=float)
+    rs = np.where(t < 900, 0.05 * t, 0.05 * 900 - 0.05 * (t - 900))
+    rs = rs + np.random.default_rng(1).normal(0, 1.0, 1800)
+    (t2, g2, gm2), cap3 = run_series_lane(rs)
+    print(f"lane B gate path (regime shift): trend honesty={t2.honesty.verdict} "
+          f"R2={t2.data['r2']:.3f} -> trigger skipped={g2 is None} "
+          f"gate mark={gm2.verdict if gm2 else 'n/a'}")
+    print(f"capsule sealed: {cap3.payload_hash[:16]}... verify={capsule_verify(cap3.to_json())}")
+    print("ONE ENGINE: Alpha's DIVERGE 1+2 resolved — dataflow + gating. [EXECUTED]")
